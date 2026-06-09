@@ -1,15 +1,14 @@
+import param
 import panel as pn
 import networkx as nx
-import hvplot.networkx as hvnx
-import holoviews as hv
-import pandas as pd
 
-from data.dummy_model import nodes, connections
+from bokeh_graph import NetworkGraph
+from data.dummy_model import nodes as all_nodes, connections as all_connections
 
 pn.extension(sizing_mode="stretch_width")
 
 # ---------------------------------------------------------------------------
-# ArchiMate-Farbschema (angelehnt an Standard-Notation)
+# ArchiMate-Farbschema & Domänen-Konstanten
 # ---------------------------------------------------------------------------
 NODE_COLORS = {
     "business-role":          "#FFD966",
@@ -20,110 +19,208 @@ NODE_COLORS = {
     "application-interface":  "#C6DBEF",
     "data-object":            "#74C476",
 }
-
-BUSINESS_LAYER = {"business-role", "business-process", "business-service"}
-
-ALL_STEREOTYPES = sorted({n.stereotypename for n in nodes})
-ALL_RELATIONS   = sorted({c.stereotypename for c in connections})
+BUSINESS_LAYER  = {"business-role", "business-process", "business-service"}
+ALL_STEREOTYPES = sorted({n.stereotypename for n in all_nodes})
+ALL_RELATIONS   = sorted({c.stereotypename for c in all_connections})
+uuid_to_node    = {n.uuid: n for n in all_nodes}
 
 # ---------------------------------------------------------------------------
-# Graph-Aufbau
+# Shared application state — survives filter rebuilds
 # ---------------------------------------------------------------------------
-def build_graph(stereotypes: list[str], relations: list[str]) -> nx.DiGraph:
-    G = nx.DiGraph()
-    active = {n.uuid for n in nodes if n.stereotypename in stereotypes}
+class AppState(param.Parameterized):
+    selected_uuid = param.String(default="")
 
-    for n in nodes:
-        if n.uuid in active:
-            G.add_node(n.uuid, label=n.displayname, stereotype=n.stereotypename)
+app_state = AppState()
 
-    for c in connections:
-        src, tgt = c.sourcenode[0], c.targetnode[0]
-        if c.stereotypename in relations and src in active and tgt in active:
-            G.add_edge(src, tgt, rel_type=c.stereotypename)
+# ---------------------------------------------------------------------------
+# Domain helpers: SimpleNamespace → NetworkGraph dicts
+# ---------------------------------------------------------------------------
+def archimate_layout(
+    node_list, conn_list=()
+) -> dict[str, tuple[float, float]]:
+    """Spring-layout (Fruchterman-Reingold) via NetworkX."""
+    G = nx.Graph()
+    for n in node_list:
+        G.add_node(n.uuid)
+    for c in conn_list:
+        s, t = c.sourcenode[0], c.targetnode[0]
+        if G.has_node(s) and G.has_node(t):
+            G.add_edge(s, t)
 
-    return G
+    raw = nx.spring_layout(G, seed=42, k=1.5)   # seed → reproduzierbar
+
+    # Normalisieren auf [0.05, 0.95] damit Nodes nicht am Rand kleben
+    xs = [p[0] for p in raw.values()]
+    ys = [p[1] for p in raw.values()]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+
+    def norm(v, lo, hi):
+        return 0.05 + 0.9 * (v - lo) / (hi - lo) if hi != lo else 0.5
+
+    return {
+        uuid: (norm(p[0], x_min, x_max), norm(p[1], y_min, y_max))
+        for uuid, p in raw.items()
+    }
 
 
-def archimate_layout(G: nx.DiGraph) -> dict:
-    """Business-Layer oben (y=1), Application-Layer unten (y=0)."""
-    top    = [n for n in G if G.nodes[n]["stereotype"] in BUSINESS_LAYER]
-    bottom = [n for n in G if G.nodes[n]["stereotype"] not in BUSINESS_LAYER]
+def to_nodes_data(node_list, pos: dict) -> list[dict]:
+    return [
+        {
+            "id":         n.uuid,
+            "label":      n.displayname,
+            "x":          pos[n.uuid][0],
+            "y":          pos[n.uuid][1],
+            "color":      NODE_COLORS.get(n.stereotypename, "#CCCCCC"),
+            "stereotype": n.stereotypename,
+        }
+        for n in node_list
+    ]
 
-    pos = {}
-    for i, n in enumerate(top):
-        pos[n] = ((i + 1) / (len(top) + 1), 1.0)
-    for i, n in enumerate(bottom):
-        pos[n] = ((i + 1) / (len(bottom) + 1), 0.0)
-    return pos
 
+def to_edges_data(conn_list, active_uuids: set) -> list[dict]:
+    return [
+        {
+            "source": c.sourcenode[0],
+            "target": c.targetnode[0],
+            "label":  c.stereotypename,
+        }
+        for c in conn_list
+        if c.sourcenode[0] in active_uuids and c.targetnode[0] in active_uuids
+    ]
 
 # ---------------------------------------------------------------------------
 # Widgets
 # ---------------------------------------------------------------------------
 stereotype_filter = pn.widgets.CheckBoxGroup(
-    name="Node-Typen",
-    value=ALL_STEREOTYPES[:],
-    options=ALL_STEREOTYPES,
+    name="Node-Typen", value=ALL_STEREOTYPES[:], options=ALL_STEREOTYPES,
 )
-
 relation_filter = pn.widgets.CheckBoxGroup(
-    name="Beziehungstypen",
-    value=ALL_RELATIONS[:],
-    options=ALL_RELATIONS,
+    name="Beziehungstypen", value=ALL_RELATIONS[:], options=ALL_RELATIONS,
 )
 
 # ---------------------------------------------------------------------------
-# Reaktive Graphdarstellung
+# Graph pane — rebuilt on filter change
 # ---------------------------------------------------------------------------
 @pn.depends(stereotype_filter, relation_filter)
-def graph_panel(stereotypes, relations):
+def graph_pane(stereotypes, relations):
     if not stereotypes:
         return pn.pane.Markdown("_Bitte mindestens einen Node-Typ auswählen._")
 
-    G = build_graph(stereotypes, relations)
-
-    if G.number_of_nodes() == 0:
+    visible_nodes = [n for n in all_nodes if n.stereotypename in stereotypes]
+    if not visible_nodes:
         return pn.pane.Markdown("_Keine Nodes nach aktuellem Filter._")
 
-    pos    = archimate_layout(G)
-    labels = {n: G.nodes[n]["label"] for n in G}
-    colors = [NODE_COLORS.get(G.nodes[n]["stereotype"], "#CCCCCC") for n in G]
+    active_uuids  = {n.uuid for n in visible_nodes}
+    visible_conns = [c for c in all_connections
+                     if c.stereotypename in relations
+                     and c.sourcenode[0] in active_uuids
+                     and c.targetnode[0] in active_uuids]
 
-    node_plot = hvnx.draw_networkx_nodes(G, pos, node_color=colors, node_size=1500,
-                                          alpha=0.9)
-    edge_plot = hvnx.draw_networkx_edges(G, pos, arrows=True, arrowstyle="-|>",
-                                          arrowsize=20, edge_color="#555555")
-    # draw_networkx_labels hat einen API-Bug in aktuellen hvplot-Versionen →
-    # Labels direkt als HoloViews-Element aufbauen
-    label_df   = pd.DataFrame(
-        [{"x": pos[n][0], "y": pos[n][1], "text": labels[n]} for n in G.nodes]
+    pos        = archimate_layout(visible_nodes, visible_conns)
+    nodes_data = to_nodes_data(visible_nodes, pos)
+    edges_data = to_edges_data(visible_conns, active_uuids)
+
+    # Reset previous selection when filters change
+    app_state.selected_uuid = ""
+
+    g = NetworkGraph(
+        nodes_data,
+        edges_data,
+        tooltips=[("Name", "@label"), ("Stereotyp", "@stereotype")],
+        show_edge_labels=True,
+        on_select=lambda uid: setattr(app_state, "selected_uuid", uid),
     )
-    label_plot = hv.Labels(label_df, kdims=["x", "y"], vdims=["text"])
 
-    # opts separat pro Element-Typ setzen, um Float-Width-Fehler im Overlay zu vermeiden
-    combined = (node_plot * edge_plot * label_plot).opts(
-        hv.opts.Labels(text_font_size="8pt", text_color="black", yoffset=0.06),
-        hv.opts.Overlay(xaxis=None, yaxis=None, toolbar="above",
-                        width=860, height=520),
+    return pn.pane.Bokeh(g.figure, sizing_mode="stretch_width")
+
+# ---------------------------------------------------------------------------
+# Detail pane — updates on node selection
+# ---------------------------------------------------------------------------
+@pn.depends(app_state.param.selected_uuid)
+def detail_pane(uuid):
+    if not uuid:
+        return _empty_detail()
+
+    node = uuid_to_node.get(uuid)
+    if node is None:
+        return _empty_detail()
+
+    active_uuids = {n.uuid for n in all_nodes
+                    if n.stereotypename in stereotype_filter.value}
+
+    outgoing = [c for c in all_connections
+                if c.sourcenode[0] == uuid and c.targetnode[0] in active_uuids]
+    incoming = [c for c in all_connections
+                if c.targetnode[0] == uuid and c.sourcenode[0] in active_uuids]
+
+    return _build_detail(node, outgoing, incoming)
+
+
+def _empty_detail():
+    return pn.pane.HTML(
+        '<div style="color:#aaa;font-size:13px;padding:16px 0;text-align:center">'
+        '&#8592; Node anklicken'
+        '</div>'
     )
 
-    return pn.pane.HoloViews(combined, sizing_mode="stretch_width")
 
+def _conn_item(partner_name: str, rel_type: str, direction: str) -> str:
+    arrow = "→" if direction == "out" else "←"
+    bg    = "#EBF5FB" if direction == "out" else "#FEF9E7"
+    return (
+        f'<div style="padding:6px 8px;margin:4px 0;border-radius:5px;background:{bg};'
+        f'font-size:12px;line-height:1.5">'
+        f'<b>{arrow} {partner_name}</b><br>'
+        f'<span style="color:#666;font-family:monospace;font-size:11px">{rel_type}</span>'
+        f'</div>'
+    )
+
+
+def _build_detail(node, outgoing, incoming) -> pn.Column:
+    color = NODE_COLORS.get(node.stereotypename, "#eee")
+    parts = [
+        f'<div style="background:{color};padding:10px 12px;border-radius:6px;margin-bottom:8px">'
+        f'<div style="font-size:14px;font-weight:bold">{node.displayname}</div>'
+        f'<div style="font-size:11px;color:#555;margin-top:3px;font-family:monospace">'
+        f'{node.stereotypename}</div></div>'
+    ]
+
+    if outgoing:
+        parts.append('<div style="font-size:12px;font-weight:bold;margin:10px 0 4px">Ausgehend</div>')
+        for c in outgoing:
+            partner = uuid_to_node.get(c.targetnode[0])
+            if partner:
+                parts.append(_conn_item(partner.displayname, c.stereotypename, "out"))
+
+    if incoming:
+        parts.append('<div style="font-size:12px;font-weight:bold;margin:10px 0 4px">Eingehend</div>')
+        for c in incoming:
+            partner = uuid_to_node.get(c.sourcenode[0])
+            if partner:
+                parts.append(_conn_item(partner.displayname, c.stereotypename, "in"))
+
+    if not outgoing and not incoming:
+        parts.append('<div style="color:#aaa;font-size:12px">Keine Verbindungen im Filter.</div>')
+
+    parts.append(
+        f'<div style="font-size:10px;color:#ccc;margin-top:12px;'
+        f'font-family:monospace;word-break:break-all">{node.uuid}</div>'
+    )
+
+    return pn.pane.HTML("".join(parts), sizing_mode="stretch_width")
 
 # ---------------------------------------------------------------------------
 # Legende
 # ---------------------------------------------------------------------------
 def legend_html() -> str:
-    items = "".join(
+    return "".join(
         f'<div style="display:flex;align-items:center;gap:6px;margin:3px 0">'
-        f'<div style="width:14px;height:14px;border-radius:3px;background:{color};'
-        f'border:1px solid #aaa"></div>'
-        f'<span style="font-size:12px">{stereo}</span></div>'
+        f'<div style="width:12px;height:12px;border-radius:50%;background:{color};'
+        f'border:1px solid #aaa;flex-shrink:0"></div>'
+        f'<span style="font-size:11px">{stereo}</span></div>'
         for stereo, color in NODE_COLORS.items()
     )
-    return f"<div>{items}</div>"
-
 
 # ---------------------------------------------------------------------------
 # Layout
@@ -139,23 +236,36 @@ sidebar = pn.Column(
     pn.layout.Divider(),
     "**Legende**",
     pn.pane.HTML(legend_html()),
-    width=260,
+    width=250,
 )
 
-main = pn.Column(
-    "# ArchiMate Graphansicht",
-    pn.pane.Markdown(
-        "_Business-Layer (oben) → Application-Layer (unten). "
-        "Filter über die Sidebar._",
-        styles={"color": "#666"},
+detail_card = pn.Card(
+    detail_pane,
+    title="Node-Details",
+    collapsible=False,
+    width=280,
+    styles={"overflow-y": "auto"},
+)
+
+main_area = pn.Row(
+    pn.Column(
+        "# ArchiMate Graphansicht",
+        pn.pane.Markdown(
+            "_Business-Layer (oben) · Application-Layer (unten) · "
+            "Node anklicken für Details_",
+            styles={"color": "#888", "margin-bottom": "4px"},
+        ),
+        graph_pane,
+        sizing_mode="stretch_width",
     ),
-    graph_panel,
+    detail_card,
+    sizing_mode="stretch_width",
 )
 
 template = pn.template.FastListTemplate(
     title="EAM Graph Analyse",
     sidebar=[sidebar],
-    main=[main],
+    main=[main_area],
     accent="#0072B5",
 )
 
